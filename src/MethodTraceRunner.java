@@ -1,10 +1,7 @@
 import com.android.ddmlib.*;
 import org.apache.commons.cli.*;
 
-import java.io.BufferedOutputStream;
-import java.io.File;
-import java.io.FileOutputStream;
-import java.io.IOException;
+import java.io.*;
 import java.util.Arrays;
 import java.util.concurrent.TimeUnit;
 
@@ -13,9 +10,12 @@ import java.util.concurrent.TimeUnit;
  */
 public class MethodTraceRunner {
     private static final String TAG = "MethodTraceRunner";
+    private static String deviceSerial;
     private static String packageName;
-    private static String outputFile;
-    private static int traceDuration;
+    private static String outputDirectory;
+    private static int bufferSize;
+    private static int sampleRate;
+
 
     public static void main(String[] args) throws IOException {
         parseArgs(args);
@@ -27,20 +27,32 @@ public class MethodTraceRunner {
         //device
         waitForDevice(bridge);
         IDevice[] devices = bridge.getDevices();
-        if (devices.length > 1) {
-            exitWithError("more than one device");
-        } else if (devices.length == 0) {
+        if (devices.length == 0) {
             exitWithError("no device found");
         }
-        IDevice device = devices[0];
-        Log.d(TAG, "device: " + device);
+        IDevice device = null;
+        for (IDevice dev : devices) {
+            if (deviceSerial.equals(dev.getSerialNumber())) {
+                device = dev;
+                break;
+            }
+        }
+        if (device == null) {
+            exitWithError("target device not available");
+        }
+        System.out.println("device: " + device);
 
         //client
         waitForClient(device, packageName);
         Client client = device.getClient(packageName);
         Log.d(TAG, "client: " + client);
 
+        DdmPreferences.setProfilerBufferSizeMb(bufferSize);
+
         ClientData.setMethodProfilingHandler(new ClientData.IMethodProfilingHandler() {
+            private long totalBytes = 0;
+            private int trace_file_count = 1;
+
             @Override
             public void onSuccess(String s, Client client) {
                 Log.d(TAG, "onSuccess: " + s + " " + client);
@@ -49,15 +61,23 @@ public class MethodTraceRunner {
             @Override
             public void onSuccess(byte[] bytes, Client client) {
                 Log.d(TAG, "onSuccess: " + client);
+//                Log.i(TAG, "bytes length: " + bytes.length);
 
                 BufferedOutputStream bs = null;
 
+                String current_filename = outputDirectory + File.separator + String.format("%02d", trace_file_count) + ".trace";
                 try {
-                    FileOutputStream fs = new FileOutputStream(new File(outputFile));
+                    FileOutputStream fs = new FileOutputStream(new File(current_filename));
                     bs = new BufferedOutputStream(fs);
                     bs.write(bytes);
+//                    totalBytes = totalBytes + bytes.length;
                     bs.close();
                     bs = null;
+//                    if (totalBytes > bufferSize * 1024 * 1024) {
+//                        Log.i(TAG, "totalBytes exceed bufferSize. change trace file.");
+//                        totalBytes = 0;
+//                        trace_file_count += 1;
+//                    }
                 } catch (Exception e) {
                     e.printStackTrace();
                 }
@@ -67,8 +87,8 @@ public class MethodTraceRunner {
                 } catch (Exception ignored) {
                 }
 
-                Log.d(TAG, "trace file: " + outputFile);
-                System.out.println("trace file saved at " + System.getProperty("user.dir") + File.separator + outputFile);
+                Log.i(TAG, "trace file: " + current_filename);
+                System.out.println("trace file saved at " + current_filename);
                 System.exit(0);
             }
 
@@ -84,18 +104,31 @@ public class MethodTraceRunner {
 
         });
 
-        System.out.printf("will profile %s, device: %s, client: %s, for %d seconds%n", packageName, device, client, traceDuration);
-        Log.d(TAG, "start Sampling Profiler");
-        client.startSamplingProfiler(10, TimeUnit.MILLISECONDS);
+        Log.i(TAG, String.format("will profile %s, device: %s, client: %s%n", packageName, device, client));
+        System.out.println("start Sampling Profiler\nType 'stop' for stop profiler.");
+        long s_time = System.currentTimeMillis();
+//        client.startMethodTracer();
+        client.startSamplingProfiler(sampleRate, TimeUnit.MILLISECONDS);
 
+        boolean isWaiting = true;
         try {
-            Log.d(TAG, "wait " + traceDuration + " seconds");
-            Thread.sleep(traceDuration * 1000);
+            BufferedReader br = new BufferedReader(new InputStreamReader(System.in));
+
+            String input;
+            while(isWaiting){
+                while(!br.ready()) {
+                    Thread.sleep(200);
+                }
+                input = br.readLine();
+                if (input.equals("stop"))
+                    isWaiting = false;
+            }
         } catch (InterruptedException e) {
             e.printStackTrace();
         }
 
-        Log.d(TAG, "stop Sampling Profiler");
+        Log.i(TAG, "stop Sampling Profiler");
+//        client.stopMethodTracer();
         client.stopSamplingProfiler();
     }
 
@@ -105,9 +138,11 @@ public class MethodTraceRunner {
         Options options = new Options();
         options.addOption("h", false, "show help msg");
         options.addOption("v", false, "verbose log");
+        options.addOption("s", true, "device serial");
         options.addOption("p", true, "package name");
-        options.addOption("o", true, "output file");
-        options.addOption("t", true, "trace time");
+        options.addOption("o", true, "output directory");
+        options.addOption("b", true, "buffer size (MB)");
+        options.addOption("r", true, "sample rate (ms)");
 
         try {
             CommandLine cmd = new DefaultParser().parse(options, args);
@@ -121,18 +156,29 @@ public class MethodTraceRunner {
                 DdmPreferences.setLogLevel(Log.LogLevel.DEBUG.getStringValue());
             }
 
+            deviceSerial = cmd.getOptionValue("s", "");
+            if (deviceSerial.isEmpty()) {
+                exitWithError("deviceSerial not specified, use -s arg to set");
+            }
+            Log.i(TAG, "deviceSerial: " + deviceSerial);
+
             packageName = cmd.getOptionValue("p", "");
             if (packageName.isEmpty()) {
                 exitWithError("PackageName not specified, use -p arg to set");
             }
             Log.i(TAG, "packageName: " + packageName);
 
-            outputFile = cmd.getOptionValue("o", "t.trace");
-            Log.i(TAG, "outputFile: " + outputFile);
+            outputDirectory = cmd.getOptionValue("o", "");
+            if (outputDirectory.isEmpty()) {
+                exitWithError("outputDirectory not specified, use -o arg to set");
+            }
+            Log.i(TAG, "outputDirectory: " + outputDirectory);
 
-            traceDuration = Integer.parseInt(cmd.getOptionValue("t", "5"));
-            Log.d(TAG, "traceDuration: " + traceDuration);
+            bufferSize = Integer.parseInt(cmd.getOptionValue("b", "8"));
+            Log.d(TAG, "bufferSize: " + bufferSize + " MB");
 
+            sampleRate = Integer.parseInt(cmd.getOptionValue("r", "10"));
+            Log.d(TAG, "sampleRate: " + sampleRate + " ms");
         } catch (Exception e) {
             printHelpMsg(options);
             exitWithError(e);
